@@ -22,9 +22,7 @@
 #include <wallet/bdb.h>
 #endif
 #include <wallet/migrate.h>
-#ifdef USE_SQLITE
 #include <wallet/sqlite.h>
-#endif
 #include <wallet/wallet.h>
 
 #include <atomic>
@@ -152,6 +150,11 @@ bool WalletBatch::WriteCryptedKey(const CPubKey& vchPubKey,
 bool WalletBatch::WriteMasterKey(unsigned int nID, const CMasterKey& kMasterKey)
 {
     return WriteIC(std::make_pair(DBKeys::MASTER_KEY, nID), kMasterKey, true);
+}
+
+bool WalletBatch::EraseMasterKey(unsigned int id)
+{
+    return EraseIC(std::make_pair(DBKeys::MASTER_KEY, id));
 }
 
 bool WalletBatch::WriteCScript(const uint160& hash, const CScript& redeemScript)
@@ -482,6 +485,11 @@ static DBErrors LoadWalletFlags(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIV
             pwallet->WalletLogPrintf("Error reading wallet database: Unknown non-tolerable wallet flags found\n");
             return DBErrors::TOO_NEW;
         }
+        // All wallets must be descriptor wallets unless opened with a bdb_ro db
+        // bdb_ro is only used for legacy to descriptor migration.
+        if (pwallet->GetDatabase().Format() != "bdb_ro" && !pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+            return DBErrors::LEGACY_WALLET;
+        }
     }
     return DBErrors::LOAD_OK;
 }
@@ -537,6 +545,35 @@ static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std:
     return LoadRecords(pwallet, batch, key, prefix, load_func);
 }
 
+bool HasLegacyRecords(CWallet& wallet)
+{
+    const auto& batch = wallet.GetDatabase().MakeBatch();
+    return HasLegacyRecords(wallet, *batch);
+}
+
+bool HasLegacyRecords(CWallet& wallet, DatabaseBatch& batch)
+{
+    for (const auto& type : DBKeys::LEGACY_TYPES) {
+        DataStream key;
+        DataStream value{};
+        DataStream prefix;
+
+        prefix << type;
+        std::unique_ptr<DatabaseCursor> cursor = batch.GetNewPrefixCursor(prefix);
+        if (!cursor) {
+            // Could only happen on a closed db, which means there is an error in the code flow.
+            wallet.WalletLogPrintf("Error getting database cursor for '%s' records", type);
+            throw std::runtime_error(strprintf("Error getting database cursor for '%s' records", type));
+        }
+
+        DatabaseCursor::Status status = cursor->Next(key, value);
+        if (status != DatabaseCursor::Status::DONE) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static DBErrors LoadLegacyWalletRecords(CWallet* pwallet, DatabaseBatch& batch, int last_client) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);
@@ -544,23 +581,9 @@ static DBErrors LoadLegacyWalletRecords(CWallet* pwallet, DatabaseBatch& batch, 
 
     // Make sure descriptor wallets don't have any legacy records
     if (pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
-        for (const auto& type : DBKeys::LEGACY_TYPES) {
-            DataStream key;
-            DataStream value{};
-
-            DataStream prefix;
-            prefix << type;
-            std::unique_ptr<DatabaseCursor> cursor = batch.GetNewPrefixCursor(prefix);
-            if (!cursor) {
-                pwallet->WalletLogPrintf("Error getting database cursor for '%s' records\n", type);
-                return DBErrors::CORRUPT;
-            }
-
-            DatabaseCursor::Status status = cursor->Next(key, value);
-            if (status != DatabaseCursor::Status::DONE) {
-                pwallet->WalletLogPrintf("Error: Unexpected legacy entry found in descriptor wallet %s. The wallet might have been tampered with or created with malicious intent.\n", pwallet->GetName());
-                return DBErrors::UNEXPECTED_LEGACY_ENTRY;
-            }
+        if (HasLegacyRecords(*pwallet, batch)) {
+            pwallet->WalletLogPrintf("Error: Unexpected legacy entry found in descriptor wallet %s. The wallet might have been tampered with or created with malicious intent.\n", pwallet->GetName());
+            return DBErrors::UNEXPECTED_LEGACY_ENTRY;
         }
 
         return DBErrors::LOAD_OK;
@@ -1110,6 +1133,14 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
     });
     result = std::max(result, order_pos_res.m_result);
 
+    // After loading all tx records, abandon any coinbase that is no longer in the active chain.
+    // This could happen during an external wallet load, or if the user replaced the chain data.
+    for (auto& [id, wtx] : pwallet->mapWallet) {
+        if (wtx.IsCoinBase() && wtx.isInactive()) {
+            pwallet->AbandonTransaction(wtx);
+        }
+    }
+
     return result;
 }
 
@@ -1239,6 +1270,21 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         pwallet->UpgradeDescriptorCache();
     } catch (...) {
         result = DBErrors::CORRUPT;
+    }
+
+    // Since it was accidentally possible to "encrypt" a wallet with private keys disabled, we should check if this is
+    // such a wallet and remove the encryption key records to avoid any future issues.
+    // Although wallets without private keys should not have *ckey records, we should double check that.
+    // Removing the mkey records is only safe if there are no *ckey records.
+    if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && pwallet->HasEncryptionKeys() && !pwallet->HaveCryptedKeys()) {
+        pwallet->WalletLogPrintf("Detected extraneous encryption keys in this wallet without private keys. Removing extraneous encryption keys.\n");
+        for (const auto& [id, _] : pwallet->mapMasterKeys) {
+            if (!EraseMasterKey(id)) {
+                pwallet->WalletLogPrintf("Error: Unable to remove extraneous encryption key '%u'. Wallet corrupt.\n", id);
+                return DBErrors::CORRUPT;
+            }
+        }
+        pwallet->mapMasterKeys.clear();
     }
 
     return result;
@@ -1391,7 +1437,7 @@ std::unique_ptr<WalletDatabase> MakeDatabase(const fs::path& path, const Databas
     std::optional<DatabaseFormat> format;
     if (exists) {
         if (IsBDBFile(BDBDataFile(path))) {
-            format = DatabaseFormat::BERKELEY;
+            format = DatabaseFormat::BERKELEY_RO;
         }
         if (IsSQLiteFile(SQLiteDataFile(path))) {
             if (format) {
@@ -1419,9 +1465,11 @@ std::unique_ptr<WalletDatabase> MakeDatabase(const fs::path& path, const Databas
         return nullptr;
     }
 
-    // If BERKELEY was the format, then change the format from BERKELEY to BERKELEY_RO
-    if (format && options.require_format && format == DatabaseFormat::BERKELEY && options.require_format == DatabaseFormat::BERKELEY_RO) {
-        format = DatabaseFormat::BERKELEY_RO;
+    // BERKELEY_RO can only be opened if require_format was set, which only occurs in migration.
+    if (format && format == DatabaseFormat::BERKELEY_RO && (!options.require_format || options.require_format != DatabaseFormat::BERKELEY_RO)) {
+        error = Untranslated(strprintf("Failed to open database path '%s'. The wallet appears to be a Legacy wallet, please use the wallet migration tool (migratewallet RPC).", fs::PathToString(path)));
+        status = DatabaseStatus::FAILED_BAD_FORMAT;
+        return nullptr;
     }
 
     // A db already exists so format is set, but options also specifies the format, so make sure they agree
@@ -1434,42 +1482,20 @@ std::unique_ptr<WalletDatabase> MakeDatabase(const fs::path& path, const Databas
     // Format is not set when a db doesn't already exist, so use the format specified by the options if it is set.
     if (!format && options.require_format) format = options.require_format;
 
-    // If the format is not specified or detected, choose the default format based on what is available. We prefer BDB over SQLite for now.
     if (!format) {
-#ifdef USE_SQLITE
         format = DatabaseFormat::SQLITE;
-#endif
-#ifdef USE_BDB
-        format = DatabaseFormat::BERKELEY;
-#endif
     }
 
     if (format == DatabaseFormat::SQLITE) {
-#ifdef USE_SQLITE
-        if constexpr (true) {
-            return MakeSQLiteDatabase(path, options, status, error);
-        } else
-#endif
-        {
-            error = Untranslated(strprintf("Failed to open database path '%s'. Build does not support SQLite database format.", fs::PathToString(path)));
-            status = DatabaseStatus::FAILED_BAD_FORMAT;
-            return nullptr;
-        }
+        return MakeSQLiteDatabase(path, options, status, error);
     }
 
     if (format == DatabaseFormat::BERKELEY_RO) {
         return MakeBerkeleyRODatabase(path, options, status, error);
     }
 
-#ifdef USE_BDB
-    if constexpr (true) {
-        return MakeBerkeleyDatabase(path, options, status, error);
-    } else
-#endif
-    {
-        error = Untranslated(strprintf("Failed to open database path '%s'. Build does not support Berkeley DB database format.", fs::PathToString(path)));
-        status = DatabaseStatus::FAILED_BAD_FORMAT;
-        return nullptr;
-    }
+    error = Untranslated(STR_INTERNAL_BUG("Could not determine wallet format"));
+    status = DatabaseStatus::FAILED_BAD_FORMAT;
+    return nullptr;
 }
 } // namespace wallet

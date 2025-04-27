@@ -76,6 +76,10 @@ def assert_equal(thing1, thing2, *args):
     if thing1 != thing2 or any(thing1 != arg for arg in args):
         raise AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
 
+def assert_not_equal(thing1, thing2, *, error_message=""):
+    if thing1 == thing2:
+        raise AssertionError(f"Both values are {thing1}{f', {error_message}' if error_message else ''}")
+
 
 def assert_greater_than(thing1, thing2):
     if thing1 <= thing2:
@@ -315,6 +319,13 @@ def wait_until_helper_internal(predicate, *, timeout=60, lock=None, timeout_fact
     predicate_source = "''''\n" + inspect.getsource(predicate) + "'''"
     logger.error("wait_until() failed. Predicate: {}".format(predicate_source))
     raise AssertionError("Predicate {} not true after {} seconds".format(predicate_source, timeout))
+
+
+def bpf_cflags():
+    return [
+        "-Wno-error=implicit-function-declaration",
+        "-Wno-duplicate-decl-specifier",  # https://github.com/bitcoin/bitcoin/issues/32322
+    ]
 
 
 def sha256sum_file(filename):
@@ -592,3 +603,10 @@ def find_vout_for_address(node, txid, addr):
         if addr == tx["vout"][i]["scriptPubKey"]["address"]:
             return i
     raise RuntimeError("Vout not found for address: txid=%s, addr=%s" % (txid, addr))
+
+
+def sync_txindex(test_framework, node):
+    test_framework.log.debug("Waiting for node txindex to sync")
+    sync_start = int(time.time())
+    test_framework.wait_until(lambda: node.getindexinfo("txindex")["txindex"]["synced"])
+    test_framework.log.debug(f"Synced in {time.time() - sync_start} seconds")
