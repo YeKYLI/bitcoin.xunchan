@@ -1,30 +1,13 @@
-# get code
+# build
 
 git clone git@github.com:YeKYLI/bitcoin.xunchan.git
 
-# build
+sudo apt-get install libsqlite3-dev libboost-dev libevent-dev -y
 
-sudo apt-get install libsqlite3-dev
-
-sudo apt install libboost-dev
-
-sudo apt  install libevent-dev
-
-cmake -B build
-
-cd build
-
-make
-
-make install
+cmake -B build && cd build && make 
 
 # run
 
 bitcoind
 
-# Modify code
-
-## Modify initial coin num
-
-## 
 

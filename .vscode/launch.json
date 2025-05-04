@@ -1,0 +1,35 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(gdb) Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "/home/xunchan/bitcoin.xunchan/build/src/bitcoind",
+            "stopAtEntry": true,
+            "cwd": "/home/xunchan/bitcoin.xunchan/",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "dir /home/xunchan/bitcoin.xunchan/src",
+                    "ignoreFailures": false
+                },
+                
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "break pthread_create",
+                    "ignoreFailures": false
+                },
+
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "catch syscal clone",
+                    "ignoreFailures": false
+                }
+            ]
+        }
+    ]
+}  

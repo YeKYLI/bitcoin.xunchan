@@ -1301,9 +1301,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     assert(!node.scheduler);
-    node.scheduler = std::make_unique<CScheduler>();
+    node.scheduler = std::make_unique<CScheduler>();     // TO DO
     auto& scheduler = *node.scheduler;
 
+    /* LEARNXXX
+    make thread_pool here to serve multiple service
+    */
     // Start the lightweight task scheduler thread
     scheduler.m_service_thread = std::thread(util::TraceThread, "scheduler", [&] { scheduler.serviceQueue(); });
 
